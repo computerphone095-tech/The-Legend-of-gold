@@ -207,7 +207,7 @@ P = "%s" if USE_POSTGRES else "?"  # SQL placeholder — Postgres %s, SQLite ?
 
 try:
     import pg8000
-    from urllib.parse import urlparse
+    from urllib.parse import urlparse, unquote
 except Exception:
     pg8000 = None  # type: ignore
 
@@ -222,11 +222,12 @@ _PG_PARAMS = None
 if USE_POSTGRES:
     _parsed = urlparse(DATABASE_URL)
     _PG_PARAMS = {
-        "user": _parsed.username,
-        "password": _parsed.password,
+        # unquote: password/user keessatti mallattoon addaa (%40, %3A kkf) yoo jiraate sirriitti hiikuuf
+        "user": unquote(_parsed.username or ""),
+        "password": unquote(_parsed.password or ""),
         "host": _parsed.hostname,
         "port": _parsed.port or 5432,
-        "database": _parsed.path.lstrip("/"),
+        "database": unquote(_parsed.path.lstrip("/")),
         "ssl_context": True,
     }
 
@@ -247,56 +248,86 @@ def get_conn():
     return _local.conn
 
 
+def reset_conn():
+    """Connection cabe/cufame (fkf Neon idle booda compute suspend godhe) yoo ta'e,
+    kaa'ame sana gatee, gaaffii itti aanu irratti haaraa akka uumamu godha."""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            del _local.conn
+        except AttributeError:
+            pass
+
+
+def db_execute(sql: str, params: tuple = (), fetch: str = "none"):
+    """Gaaffii DB hunda asiin darba. Connection cabe (Neon idle → suspend) yoo ta'e,
+    tokko deebi'ee connect godhee irra deebi'ee yaala; kanaan bot-ichi idle booda hin cabu.
+    fetch: 'none' | 'one' | 'all'."""
+    last_error = None
+    for attempt in (1, 2):
+        with _db_lock:
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                result = None
+                if fetch == "one":
+                    result = cur.fetchone()
+                elif fetch == "all":
+                    result = cur.fetchall()
+                if not USE_POSTGRES:
+                    conn.commit()  # SQLite; Postgres autocommit waan ta'eef hin barbaachisu
+                return result
+            except Exception as e:
+                last_error = e
+                log.warning(f"DB gaaffii dadhabe (yaalii {attempt}/2): {e}")
+                reset_conn()
+    raise last_error  # type: ignore[misc]
+
+
 def init_db():
-    with _db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        id_type = "BIGINT" if USE_POSTGRES else "INTEGER"
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id {id_type} PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                language TEXT DEFAULT 'om',
-                mode TEXT DEFAULT 'both',
-                ai_model TEXT DEFAULT 'grok',
-                last_seen TEXT
-            )
-            """
+    id_type = "BIGINT" if USE_POSTGRES else "INTEGER"
+    db_execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id {id_type} PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            language TEXT DEFAULT 'om',
+            mode TEXT DEFAULT 'both',
+            ai_model TEXT DEFAULT 'grok',
+            last_seen TEXT
         )
-        conn.commit()
+        """
+    )
     log.info(f"Database qophaa'eera ({'PostgreSQL — persistent' if USE_POSTGRES else 'SQLite — lokaalaa'}).")
 
 
 def upsert_user(user_id: int, username: str, first_name: str):
-    with _db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            INSERT INTO users (user_id, username, first_name, last_seen)
-            VALUES ({P}, {P}, {P}, {P})
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                first_name=excluded.first_name,
-                last_seen=excluded.last_seen
-            """,
-            (user_id, username, first_name, datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
+    db_execute(
+        f"""
+        INSERT INTO users (user_id, username, first_name, last_seen)
+        VALUES ({P}, {P}, {P}, {P})
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_seen=excluded.last_seen
+        """,
+        (user_id, username, first_name, datetime.now(timezone.utc).isoformat()),
+    )
 
 
 def get_user(user_id: int):
-    with _db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT user_id, username, first_name, language, mode, ai_model, last_seen "
-            f"FROM users WHERE user_id={P}",
-            (user_id,),
-        )
-        row = cur.fetchone()
+    row = db_execute(
+        f"SELECT user_id, username, first_name, language, mode, ai_model, last_seen "
+        f"FROM users WHERE user_id={P}",
+        (user_id,),
+        fetch="one",
+    )
     if not row:
         return None
     keys = ["user_id", "username", "first_name", "language", "mode", "ai_model", "last_seen"]
@@ -304,40 +335,28 @@ def get_user(user_id: int):
 
 
 def set_user_field(user_id: int, field: str, value: str):
-    assert field in ("language", "mode", "ai_model")
-    with _db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(f"UPDATE users SET {field}={P} WHERE user_id={P}", (value, user_id))
-        conn.commit()
+    if field not in ("language", "mode", "ai_model"):
+        raise ValueError(f"Unsupported user field: {field}")
+    db_execute(f"UPDATE users SET {field}={P} WHERE user_id={P}", (value, user_id))
 
 
 def count_users() -> int:
-    with _db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users")
-        return cur.fetchone()[0]
+    row = db_execute("SELECT COUNT(*) FROM users", fetch="one")
+    return int(row[0]) if row else 0
 
 
 def top_users(limit: int = 10):
-    with _db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT user_id, username, first_name, last_seen FROM users "
-            f"ORDER BY last_seen DESC LIMIT {P}",
-            (limit,),
-        )
-        return cur.fetchall()
+    return db_execute(
+        f"SELECT user_id, username, first_name, last_seen FROM users "
+        f"ORDER BY last_seen DESC LIMIT {P}",
+        (limit,),
+        fetch="all",
+    )
 
 
 def all_user_ids():
-    with _db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM users")
-        return [r[0] for r in cur.fetchall()]
+    rows = db_execute("SELECT user_id FROM users", fetch="all")
+    return [r[0] for r in rows]
 
 
 # ------------------------------------------------------------------
@@ -864,6 +883,14 @@ def format_signal_caption(signal: dict, alert: bool = False) -> str:
         if signal.get("range_high") is not None
         else ""
     )
+    # NOTE: f-string {..} keessatti backslash (\n, \u2019) Python 3.11 fi gadi keessatti SyntaxError
+    # waan ta'eef (Render), barreeffama asitti (f-string alaatti) qopheessina.
+    confluence_line = (
+        "🎯 *Confluence*: Order Block + FVG walitti dhufan — "
+        "deebi\u2019iinsi gatii kana keessatti cimaa ta\u2019uu danda\u2019a!\n"
+        if signal.get("confluence")
+        else ""
+    )
     text = (
         f"{header}📊 *XAUUSD (Gold) — {signal.get('pattern', 'SMC Analysis')}*\n\n"
         f"{emoji} *Direction: {signal['direction']}*\n"
@@ -872,7 +899,7 @@ def format_signal_caption(signal: dict, alert: bool = False) -> str:
         f"🎯 Take Profit: `{signal['tp']:.2f}`\n"
         f"{rr_line}"
         f"{range_line}"
-        f"{'🎯 *Confluence*: Order Block + FVG walitti dhufan — deebi\u2019iinsi gatii kana keessatti cimaa ta\u2019uu danda\u2019a!\n' if signal.get('confluence') else ''}"
+        f"{confluence_line}"
         f"{as_of_line}\n"
         f"_Entry/SL zone (Order Block, Breaker Block, FVG ykn IFVG) dhugaa irratti hundaa'a — "
         f"R:R fakkeessaa (fixed) hin fayyadamu. Risk management mataa keetii eeggadhu._"
@@ -1219,7 +1246,7 @@ def handle_photo(message):
     upsert_user(user.id, user.username or "", user.first_name or "")
     if not gemini_client:
         log.warning("handle_photo: gemini_client hin qophoofne (Vision analysis dhaabbateera).")
-        .py("⚠️ Vision analysis (Gemini) hin hojjetu — GEMINI_API_KEY Secrets keessatti mirkaneessi.")
+        notify_admin("⚠️ Vision analysis (Gemini) hin hojjetu — GEMINI_API_KEY Secrets keessatti mirkaneessi.")
         safe_send(message.chat.id, "⚠️ Fakkii ammatti xiinxaluu hin dandeenyu. Booda irra deebi'ii yaali.")
         return
     bot.send_chat_action(message.chat.id, "typing")
