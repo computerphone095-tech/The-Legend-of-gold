@@ -1,0 +1,11 @@
+pyTelegramBotAPI==4.26.0
+google-genai>=1.0.0
+openai==1.65.2
+duckduckgo-search==7.5.0
+yfinance==0.2.54
+pandas==2.2.3
+matplotlib==3.10.1
+Pillow==11.1.0
+Flask==3.1.0
+gTTS==2.5.4
+pg8000==1.31.5
