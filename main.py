@@ -36,6 +36,7 @@ import pandas as pd
 import yfinance as yf
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 from flask import Flask
 
 try:
@@ -57,17 +58,106 @@ log = logging.getLogger("NeuroBro")
 # ------------------------------------------------------------------
 # ENVIRONMENT VARIABLES
 # ------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID", "0")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GROK_API_KEY = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
-PORT = int(os.getenv("PORT", "8080"))
-ALERT_INTERVAL_MIN = int(os.getenv("ALERT_INTERVAL_MIN", "15"))
+def clean_value(value: str) -> str:
+    """Iddoo duwwaa (space/newline) fi quotation mark ("..." ykn '...') gatii irraa haqa."""
+    return value.strip().strip('"').strip("'").strip()
+
+
+def env_clean(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    return default if value is None else clean_value(value)
+
+
+def safe_int(value: str, default: int, name: str = "") -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        if value:
+            log.warning(f"{name or 'Environment variable'} = {value!r} lakkoofsa sirrii miti; {default} fayyadamna.")
+        return default
+
+
+def load_env_files():
+    """Render 'Secret Files' (.env) ykn lokaalaa .env yoo jiraate, KEY=VALUE hunda environment
+    keessatti galcha. Environment variable duraan jiru HIN BALLEESSU; placeholder
+    (your_..._here) ni dhiisa."""
+    for path in (".env", "/etc/secrets/.env"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        loaded = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            key, value = line.split("=", 1)
+            key, value = key.strip(), clean_value(value)
+            if not key or not value or "your_" in value or "_here" in value:
+                continue
+            if not os.environ.get(key):
+                os.environ[key] = value
+                loaded.append(key)
+        if loaded:
+            log.info(f"{path} irraa environment variables galfaman: {loaded}")
+
+
+TELEGRAM_TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}")
+EXPECTED_ENV = [
+    "TELEGRAM_BOT_TOKEN", "ADMIN_ID", "DATABASE_URL", "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY", "GROK_API_KEY", "XAI_API_KEY", "ALERT_INTERVAL_MIN",
+]
+
+
+def env_report() -> str:
+    """Environment variables barbaachisoo haala isaanii (set/EMPTY/MISSING) agarsiisa — GATII HIN AGARSIISU."""
+    parts = []
+    for name in EXPECTED_ENV:
+        raw = os.environ.get(name)
+        parts.append(f"{name}=" + ("MISSING" if raw is None else ("EMPTY" if not raw.strip() else "set")))
+    return ", ".join(parts)
+
+
+def resolve_telegram_token() -> str:
+    raw = env_clean("TELEGRAM_BOT_TOKEN")
+    found = TELEGRAM_TOKEN_RE.search(raw)  # 'TELEGRAM_BOT_TOKEN=xxx' akka gatiitti paste yoo ta'e illee argata
+    if found:
+        return found.group(0)
+    if raw:
+        return raw  # bocni (format) hin beekamne — Telegram (getMe) murteessa
+    for key, value in os.environ.items():  # maqaan (key) dogoggora yoo ta'e
+        cleaned = clean_value(value)
+        if TELEGRAM_TOKEN_RE.fullmatch(cleaned):
+            log.warning(
+                f"TELEGRAM_BOT_TOKEN hin argamne, garuu '{key}' jedhu Telegram token fakkaata — "
+                f"inni fayyadame. Maqaa isaa 'TELEGRAM_BOT_TOKEN' tti jijjiiri."
+            )
+            return cleaned
+    return ""
+
+
+load_env_files()
+TELEGRAM_BOT_TOKEN = resolve_telegram_token()
+ADMIN_ID = env_clean("ADMIN_ID", "0")
+GEMINI_API_KEY = env_clean("GEMINI_API_KEY")
+OPENROUTER_API_KEY = env_clean("OPENROUTER_API_KEY")
+GROK_API_KEY = env_clean("GROK_API_KEY") or env_clean("XAI_API_KEY")
+PORT = safe_int(env_clean("PORT"), 8080, "PORT")
+ALERT_INTERVAL_MIN = max(1, safe_int(env_clean("ALERT_INTERVAL_MIN"), 15, "ALERT_INTERVAL_MIN"))
 _last_alert_signature = None  # scheduled_gold_scan() keessatti signal duplicate ittisuuf
 
 if not TELEGRAM_BOT_TOKEN:
-    log.critical("TELEGRAM_BOT_TOKEN hin argamne! .env ykn Secrets keessatti galchi.")
+    _raw = os.environ.get("TELEGRAM_BOT_TOKEN")
+    _state = "hin jiru (maqaan dogoggora ta'uu danda'a)" if _raw is None else "jira, garuu DUWWAA dha"
+    _similar = sorted(repr(k) for k in os.environ if any(w in k.upper() for w in ("TELEGRAM", "TOKEN", "BOT")))
+    log.critical(
+        f"TELEGRAM_BOT_TOKEN {_state}! Render 'Environment' (ykn Replit 'Secrets') keessatti maqaa "
+        f"'TELEGRAM_BOT_TOKEN' (qubee guddaa, iddoo malee) fi gatii (token qofa) galchi. "
+        f"Maqaawwan walfakkaatan: {_similar} | {env_report()}"
+    )
     sys.exit(1)
 
 try:
@@ -201,7 +291,7 @@ def t(user_id: int, key: str, **kwargs) -> str:
 # pg8000 (100% Python-ii, C-extension/binary hin barbaachifne) fayyadamna — psycopg2 (C
 # library, fkf libpq) yeroo tokko tokko Replit/Nix akkasumas platform garaa garaa irratti
 # import dhabuu (binary compatibility) uumaa waan tureef, pg8000-tu iddoo isaa bu'a.
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = env_clean("DATABASE_URL")
 USE_POSTGRES = bool(DATABASE_URL)
 P = "%s" if USE_POSTGRES else "?"  # SQL placeholder — Postgres %s, SQLite ?
 
@@ -1348,9 +1438,30 @@ def startup_health_check():
     notify_admin("\n".join(lines))
 
 
+def verify_token():
+    """Token Telegram biratti sirrii ta'uu isaa mirkaneessa. Token dogoggora/revoke ta'e (401/404)
+    yoo ta'e sababa ifa ta'een ba'a; network rakkoo yeroo yoo ta'e itti fufa."""
+    try:
+        me = bot.get_me()
+        log.info(f"Telegram bot walitti hidhame: @{me.username}")
+    except ApiTelegramException as e:
+        if getattr(e, "error_code", None) in (401, 404):
+            log.critical(
+                "TELEGRAM_BOT_TOKEN sirrii miti ykn revoke ta'eera (Telegram: %s). "
+                "@BotFather irraa token HAARAA fudhadhuutii Environment keessatti bakka buusi.",
+                getattr(e, "description", e),
+            )
+            sys.exit(1)
+        log.warning(f"Telegram getMe dadhabe: {e}; itti fufa.")
+    except Exception as e:
+        log.warning(f"Telegram getMe yeroo ammaaf dadhabe (network?): {e}; itti fufa.")
+
+
 def main():
+    log.info("Config: " + env_report())
     init_db()
     keep_alive()
+    verify_token()
     startup_health_check()
     threading.Thread(target=scheduled_gold_scan, daemon=True).start()
     log.info(f"Auto Alert (Gold scan) daqiiqaa {ALERT_INTERVAL_MIN} tokkoon tokkoon jalqabe.")
