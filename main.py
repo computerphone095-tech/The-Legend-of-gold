@@ -288,38 +288,25 @@ def t(user_id: int, key: str, **kwargs) -> str:
 # (Render free tier disk-ni persistent waan hin taaneef, kun barbaachisaa dha).
 # DATABASE_URL yoo hin kennamin, SQLite lokaalaa (fkf Replit local dev) ofumaan fayyadama.
 #
-# pg8000 (100% Python-ii, C-extension/binary hin barbaachifne) fayyadamna — psycopg2 (C
-# library, fkf libpq) yeroo tokko tokko Replit/Nix akkasumas platform garaa garaa irratti
-# import dhabuu (binary compatibility) uumaa waan tureef, pg8000-tu iddoo isaa bu'a.
+# psycopg2 (libpq irratti hundaa'e) fayyadamna — Neon-n mataan isaa fakkeenya (docs) hunda
+# psycopg2-tiin kenna, SCRAM-SHA-256 + channel_binding sirriitti (guutummaatti) deeggara.
+# (pg8000 yaalle ture, garuu Neon proxy waliin SCRAM negotiation irratti walsimuu dhabe —
+#  "Server iteration count is not valid" jedhu kenna ture; kanaaf gara psycopg2-tti deebine.)
 DATABASE_URL = env_clean("DATABASE_URL")
 USE_POSTGRES = bool(DATABASE_URL)
 P = "%s" if USE_POSTGRES else "?"  # SQL placeholder — Postgres %s, SQLite ?
 
 try:
-    import pg8000
-    from urllib.parse import urlparse, unquote
+    import psycopg2
 except Exception:
-    pg8000 = None  # type: ignore
+    psycopg2 = None  # type: ignore
 
-if USE_POSTGRES and pg8000 is None:
+if USE_POSTGRES and psycopg2 is None:
     log.critical(
-        "DATABASE_URL kenname, garuu pg8000 import godhuu hin dandeenye — "
-        "requirements.txt keessatti pg8000 jiraachuu isaa mirkaneessi."
+        "DATABASE_URL kenname, garuu psycopg2 import godhuu hin dandeenye — "
+        "requirements.txt keessatti psycopg2-binary jiraachuu isaa mirkaneessi."
     )
     sys.exit(1)
-
-_PG_PARAMS = None
-if USE_POSTGRES:
-    _parsed = urlparse(DATABASE_URL)
-    _PG_PARAMS = {
-        # unquote: password/user keessatti mallattoon addaa (%40, %3A kkf) yoo jiraate sirriitti hiikuuf
-        "user": unquote(_parsed.username or ""),
-        "password": unquote(_parsed.password or ""),
-        "host": _parsed.hostname,
-        "port": _parsed.port or 5432,
-        "database": unquote(_parsed.path.lstrip("/")),
-        "ssl_context": True,
-    }
 
 DB_PATH = "neurobro_ai.db"
 _db_lock = threading.Lock()
@@ -327,10 +314,12 @@ _local = threading.local()
 
 
 def get_conn():
-    """Connection tokkoo thread tokkoof (thread-local) — thread conflict ittisuuf."""
+    """Connection tokkoo thread tokkoof (thread-local) — thread conflict ittisuuf.
+    DATABASE_URL guutuu (query param kan akka sslmode/channel_binding dabalatee) kallattiin
+    libpq-tti (psycopg2 jalatti) dabarfama — sirriitti (Neon dabalatee) hiikama."""
     if not hasattr(_local, "conn"):
         if USE_POSTGRES:
-            _local.conn = pg8000.connect(**_PG_PARAMS)
+            _local.conn = psycopg2.connect(DATABASE_URL)
             _local.conn.autocommit = True
         else:
             _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
@@ -1459,8 +1448,10 @@ def verify_token():
 
 def main():
     log.info("Config: " + env_report())
-    init_db()
+    # keep_alive() jalqaba (init_db() dura) — Render-ni port banamuu barbaada (health check);
+    # DB (fkf Neon) dogoggora kamiyyuu port-ii banuu dura akka hin dhaabne godha.
     keep_alive()
+    init_db()
     verify_token()
     startup_health_check()
     threading.Thread(target=scheduled_gold_scan, daemon=True).start()
